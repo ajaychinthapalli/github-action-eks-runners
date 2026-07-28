@@ -1,6 +1,6 @@
-# ARC on EKS — Setup Guide (`github-action-runners`)
+# ARC + ArgoCD on EKS — Final Setup Guide (`github-action-runners`)
 
-Tested, working, end-to-end guide for running GitHub Actions self-hosted runners on Amazon EKS via the Actions Runner Controller (ARC). This reflects the actual working configuration for the `github-action-runners` cluster in `us-east-2`.
+Tested, working, end-to-end guide covering both phases built so far on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. Together these are the first two legs of the target architecture: GitHub + ArgoCD + Terraform + EKS. Every gotcha hit along the way is included, not just the happy path.
 
 ## Architecture recap
 
@@ -306,6 +306,179 @@ kubectl get pods -n arc-runners -w
 
 **Result from this run**: job executed successfully on `arc-runner-set-lnv6f-runner-7wh2p`, printed `running on EKS via ARC`, and completed cleanly. End-to-end pipeline confirmed working: EKS cluster → `t3.small` worker nodes → ARC controller → runner scale set → live GitHub Actions execution.
 
+## Part 2: ArgoCD — GitOps Continuous Deployment
+
+With CI (ARC) working, the next phase adds ArgoCD for GitOps-style continuous deployment: ArgoCD watches a Git repo of Kubernetes manifests and auto-syncs the cluster to match, rather than deploying via manual `kubectl`/`helm` commands. This is the second leg of the target architecture (GitHub + ArgoCD + Terraform + EKS).
+
+### Step 11: Install ArgoCD via Helm
+
+```bash
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+
+kubectl create namespace argocd
+
+helm install argocd argo/argo-cd \
+  --namespace argocd \
+  --version 9.5.0 \
+  --wait
+```
+
+```bash
+kubectl get pods -n argocd
+```
+
+Expect `argocd-server`, `argocd-repo-server`, `argocd-application-controller`, `argocd-dex-server`, `argocd-redis`, and the ApplicationSet/notifications controllers all `Running`.
+
+### Step 12: Get the initial admin password
+
+```bash
+kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' | base64 -d
+echo
+```
+
+### Step 13: Install the `argocd` CLI
+
+```bash
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+rm argocd-linux-amd64
+argocd version --client
+```
+
+### Step 14: Port-forward and log in
+
+```bash
+kubectl port-forward svc/argocd-server -n argocd 8081:443
+```
+
+Leave this running in its own terminal/tab — it's a blocking foreground process. In a separate tab:
+
+```bash
+argocd login localhost:8081 --username admin --password <password-from-step-12> --insecure
+argocd app list
+```
+
+An empty app list (not an error) is the expected result before any apps are registered.
+
+### Step 15: Add manifests to the GitOps repo
+
+Using the same repo as the ARC test workflow (`ajaychinthapalli/github-action-eks-runners`), plain YAML to start (simplest to validate the sync loop before moving to Helm/Kustomize):
+
+```bash
+mkdir -p manifests
+cat > manifests/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-demo
+  namespace: demo-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: argocd-demo
+  template:
+    metadata:
+      labels:
+        app: argocd-demo
+    spec:
+      containers:
+        - name: nginx
+          image: nginxdemos/hello:latest
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+EOF
+
+cat > manifests/service.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-demo
+  namespace: demo-app
+spec:
+  selector:
+    app: argocd-demo
+  ports:
+    - port: 80
+      targetPort: 80
+EOF
+
+git add manifests/
+git commit -m "Add ArgoCD demo manifests"
+git push
+```
+
+### Step 16: Create the destination namespace and register the app
+
+```bash
+kubectl create namespace demo-app
+
+argocd app create argocd-demo \
+  --repo https://github.com/ajaychinthapalli/github-action-eks-runners.git \
+  --path manifests \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace demo-app \
+  --sync-policy automated \
+  --self-heal
+```
+
+`--sync-policy automated --self-heal` is the core GitOps behavior: every Git push auto-deploys, and manual `kubectl` drift gets reverted back to match Git.
+
+### Step 17: Verify
+
+```bash
+argocd app get argocd-demo
+kubectl get pods -n demo-app
+```
+
+**Result from this run**: app created and synced successfully, confirming the GitOps loop (Git push → ArgoCD detects → auto-deploys) works end to end on this cluster.
+
+### Step 18: Access the ArgoCD UI
+
+AWS CloudShell has no browser-preview feature (unlike Google Cloud Shell or Cloud9), so a port-forward run inside CloudShell can't be opened in a local browser. Two working options:
+
+- **Run port-forward from your local machine instead of CloudShell** (recommended — no extra AWS cost, nothing publicly exposed):
+
+  ```bash
+  # On your local machine, with AWS CLI configured for this account
+  aws eks update-kubeconfig --name github-action-runners --region us-east-2
+  kubectl port-forward svc/argocd-server -n argocd 8081:443
+  ```
+
+  Then open `https://localhost:8081` in a local browser, accept the self-signed cert warning, and log in with `admin` / the password from Step 12.
+
+- **Expose via a LoadBalancer Service** (reachable from anywhere, but costs a bit and is publicly exposed unless the security group is restricted):
+
+  ```bash
+  kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+  kubectl get svc argocd-server -n argocd
+  ```
+
+### Troubleshooting hit during ArgoCD setup
+
+- **`Unable to listen on port 8080/8081/8082: address already in use`**: a previous `port-forward` process was still bound to that port (sometimes as a zombie that no longer responds). Find and kill it:
+
+  ```bash
+  ss -ltnp | grep <port>
+  kill -9 <PID>
+  # or, if unsure which PID:
+  pkill -9 -f "port-forward svc/argocd-server"
+  ```
+
+  Then start a fresh `port-forward` in its own tab.
+
+- **`argocd` CLI commands hang with no output**: almost always means the port-forward tunnel died silently (matches the `broken pipe` warnings that can appear in its log). Kill and restart the tunnel, then re-run `argocd login` before retrying the stuck command.
+
+- **`kubectl port-forward` log shows `Forwarding from 127.0.0.1:8081 -> 8080`** even though `443` was requested: this is normal — kubectl logs the pod's *target* port, not the *service* port you specified. Not an error.
+
 ## Pod capacity reference (3-node cluster)
 
 **maxPods = ENIs × (IPs per ENI − 1) + 2**
@@ -324,6 +497,15 @@ kubectl get pods -n arc-runners -w
 - **Namespaces**: keep the controller/listener (`arc-systems`) and runner job pods (`arc-runners`) separate, as configured here.
 - **`t3` burstable CPU**: sustained heavy CI workloads can throttle once CPU credits run out — enable "Unlimited" mode (extra cost when bursting) if that becomes an issue, or move to `m7i-flex.large`.
 - **Node headroom**: with only 3 nodes, losing one to maintenance/an AZ issue removes roughly a third of capacity — consider `minSize: 3, maxSize: 5` for headroom during rollouts.
+- **ArgoCD UI exposure**: if using the LoadBalancer option from Step 18, restrict the security group to trusted IPs rather than leaving `argocd-server` open to the internet.
+- **ArgoCD admin password**: rotate it after first login (`argocd account update-password`) rather than leaving the initial auto-generated one in place long-term.
+
+## What's next (not yet built)
+
+- Wire the ARC workflow to commit an image-tag bump to the `manifests/` folder on a successful build, so CI (ARC) and CD (ArgoCD) are fully connected rather than ArgoCD watching a repo nothing pushes to yet.
+- Migrate `cluster.yaml` (currently applied by hand via `eksctl`) into Terraform with remote state, so cluster/node group changes go through version control too.
+- Move to an App-of-Apps ArgoCD pattern once there's more than one app/environment to manage.
+- Replace the raw `kubectl create secret` for the GitHub PAT with External Secrets Operator pulling from AWS Secrets Manager.
 
 ## Sources
 
@@ -334,3 +516,5 @@ kubectl get pods -n arc-runners -w
 - [gha-runner-scale-set values.yaml](https://github.com/actions/actions-runner-controller/blob/master/charts/gha-runner-scale-set/values.yaml)
 - [Choose an optimal EC2 node instance type (max pods)](https://docs.aws.amazon.com/eks/latest/userguide/choosing-instance-type.html)
 - [Amazon EKS one-click cluster access through CloudShell](https://aws.amazon.com/about-aws/whats-new/2026/04/amazon-eks-one-click-cluster-access/)
+- [Install ArgoCD on Amazon EKS: Complete GitOps Guide](https://computingforgeeks.com/argocd-eks-gitops-complete-guide/)
+- [GitOps with ArgoCD on AWS EKS — Production Setup](https://itdefined.org/blogs/details/83/gitops-with-argocd-on-aws-eks:-the-production-grade-setup/)
