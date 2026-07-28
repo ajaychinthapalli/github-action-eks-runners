@@ -1,6 +1,7 @@
-# ARC + ArgoCD on EKS — Final Setup Guide (`github-action-runners`)
 
-Tested, working, end-to-end guide covering both phases built so far on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. Together these are the first two legs of the target architecture: GitHub + ArgoCD + Terraform + EKS. Every gotcha hit along the way is included, not just the happy path.
+# ARC + ArgoCD on EKS — Setup Guide (`github-action-runners`)
+
+Tested, working, end-to-end guide covering all four phases built so far on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file.
 
 ## Architecture recap
 
@@ -479,16 +480,97 @@ AWS CloudShell has no browser-preview feature (unlike Google Cloud Shell or Clou
 
 - **`kubectl port-forward` log shows `Forwarding from 127.0.0.1:8081 -> 8080`** even though `443` was requested: this is normal — kubectl logs the pod's *target* port, not the *service* port you specified. Not an error.
 
-## Pod capacity reference (3-node cluster)
+- **`argocd app get <name>` fails with `PermissionDenied`, but `argocd app list` works fine**: this is ArgoCD's RBAC layer returning a misleading error — it means the app **doesn't exist yet** rather than an actual permissions problem. Confirm with `argocd app list`; if the app is missing from that list, the fix is to create it, not to debug RBAC/accounts.
 
-**maxPods = ENIs × (IPs per ENI − 1) + 2**
+- **Port-forward dies entirely between sessions** (`connection refused` instead of hanging): CloudShell sessions can time out and kill foreground processes like `port-forward`. Just restart it (`kubectl port-forward svc/argocd-server -n argocd 8081:443`) and re-run `argocd login` — sessions and tokens don't survive a dead tunnel.
 
-| Instance type | Pods/node | Raw total (× 3 nodes) | Usable for workloads* |
-|---|---|---|---|
-| t3.small (3 ENIs, 6 IPs/ENI) | 17 | 51 | ~45 |
-| m7i-flex.large (upgrade path) | higher | higher | higher |
+## Part 3: Handing the runner scale set itself over to GitOps
 
-\*Subtracts ~2 system daemonset pods per node (`aws-node`, `kube-proxy`). Confirm live values with `kubectl describe node <node-name> | grep -A5 Capacity`.
+Once ArgoCD is running, `arc-runner-set` (originally installed via manual `helm install` in Step 8) can be brought under GitOps management too — so changing `minRunners`/`maxRunners` becomes a Git edit instead of a `helm upgrade` command.
+
+### Step 19: Push the Helm values file into the repo
+
+```bash
+mkdir -p arc-runner-set
+cp values-small.yaml arc-runner-set/values-small.yaml
+git add arc-runner-set/
+git commit -m "Add ARC runner scale set values for GitOps"
+git push
+```
+
+`githubConfigSecret: gh-pat` inside this file is safe to commit — it's only a reference to the *name* of a Kubernetes Secret that already exists in `arc-runners`, not the PAT value itself. That secret is created separately via `kubectl create secret` and isn't tracked in Git, so it needs to be recreated by hand if it's ever deleted — a good candidate for External Secrets Operator later (see "What's next").
+
+### Step 20: Uninstall the manual Helm release
+
+```bash
+helm list -A
+helm uninstall arc-runner-set -n arc-runners
+```
+
+Running both a manual Helm release and an ArgoCD-managed Application under the same name at once causes conflicts — this has to be one or the other.
+
+### Step 21: Create the ArgoCD Application (Helm chart + values from Git)
+
+```bash
+cat > arc-runner-set-app.yaml << 'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: arc-runner-set
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: ghcr.io/actions/actions-runner-controller-charts
+      chart: gha-runner-scale-set
+      targetRevision: 0.14.2
+      helm:
+        valueFiles:
+          - $values/arc-runner-set/values-small.yaml
+    - repoURL: https://github.com/ajaychinthapalli/github-action-eks-runners.git
+      targetRevision: HEAD
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: arc-runners
+  syncPolicy:
+    automated:
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+EOF
+
+kubectl apply -f arc-runner-set-app.yaml
+```
+
+This uses ArgoCD's multi-source pattern: `sources[0]` pulls the chart directly from its OCI registry, `sources[1]` supplies the values file from Git via the `$values` alias. No app-of-apps layer was set up on top of this (deliberately skipped for now) — this Application was applied once, directly.
+
+### Step 22: Verify the handoff
+
+```bash
+argocd app list
+argocd app get arc-runner-set
+kubectl get pods -n arc-systems
+```
+
+**Result from this run**: `arc-runner-set` shows `Healthy` / `Synced` in the ArgoCD UI, confirming the handoff from manual Helm to GitOps completed successfully.
+
+### Step 23: Update min/max runners via the values file (confirmed working)
+
+```bash
+sed -i 's/^minRunners:.*/minRunners: 1/' arc-runner-set/values-small.yaml
+sed -i 's/^maxRunners:.*/maxRunners: 10/' arc-runner-set/values-small.yaml
+
+git add arc-runner-set/values-small.yaml
+git commit -m "Adjust runner scale set min/max runners"
+git push
+
+argocd app sync arc-runner-set
+kubectl get autoscalingrunnerset arc-runner-set -n arc-runners -o jsonpath='{.spec.minRunners}{" / "}{.spec.maxRunners}'
+```
+
+No more `helm upgrade` needed for this kind of change — edit the file, push, and ArgoCD applies it (immediately if you force `argocd app sync`, otherwise within its ~3-minute poll interval). Note: `minRunners: 1` keeps one runner pod alive permanently rather than only during a job, which costs standing node capacity.
+
 
 ## Production notes
 
@@ -502,10 +584,11 @@ AWS CloudShell has no browser-preview feature (unlike Google Cloud Shell or Clou
 
 ## What's next (not yet built)
 
-- Wire the ARC workflow to commit an image-tag bump to the `manifests/` folder on a successful build, so CI (ARC) and CD (ArgoCD) are fully connected rather than ArgoCD watching a repo nothing pushes to yet.
-- Migrate `cluster.yaml` (currently applied by hand via `eksctl`) into Terraform with remote state, so cluster/node group changes go through version control too.
-- Move to an App-of-Apps ArgoCD pattern once there's more than one app/environment to manage.
+- Migrate `cluster.yaml` (currently applied by hand via `eksctl`) into Terraform with remote state, so cluster/node group changes go through version control too — the last of the four legs (GitHub + ArgoCD + Terraform + EKS).
+- Move to an App-of-Apps ArgoCD pattern once there's more than one app/environment to manage (deliberately skipped for now — `arc-runner-set` and `argocd-demo` were each applied as standalone Applications).
 - Replace the raw `kubectl create secret` for the GitHub PAT with External Secrets Operator pulling from AWS Secrets Manager.
+- Replace the public-GHCR-package workaround (Step 26) with a proper `imagePullSecret` if this moves beyond a personal POC.
+- Swap the placeholder `app/Dockerfile` (Step 24) for real application source code.
 
 ## Sources
 
