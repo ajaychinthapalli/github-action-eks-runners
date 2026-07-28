@@ -587,8 +587,6 @@ No more `helm upgrade` needed for this kind of change — edit the file, push, a
 - Migrate `cluster.yaml` (currently applied by hand via `eksctl`) into Terraform with remote state, so cluster/node group changes go through version control too — the last of the four legs (GitHub + ArgoCD + Terraform + EKS).
 - Move to an App-of-Apps ArgoCD pattern once there's more than one app/environment to manage (deliberately skipped for now — `arc-runner-set` and `argocd-demo` were each applied as standalone Applications).
 - Replace the raw `kubectl create secret` for the GitHub PAT with External Secrets Operator pulling from AWS Secrets Manager.
-- Replace the public-GHCR-package workaround (Step 26) with a proper `imagePullSecret` if this moves beyond a personal POC.
-- Swap the placeholder `app/Dockerfile` (Step 24) for real application source code.
 
 ## Sources
 
