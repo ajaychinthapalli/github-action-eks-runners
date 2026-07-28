@@ -1,7 +1,7 @@
 
 # ARC + ArgoCD on EKS — Setup Guide (`github-action-runners`)
 
-Tested, working, end-to-end guide covering all four phases built so far on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file.
+Tested, working, end-to-end guide covering all three phases built so far on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file.
 
 ## Architecture recap
 
