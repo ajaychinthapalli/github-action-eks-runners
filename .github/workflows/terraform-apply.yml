@@ -1,0 +1,97 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-apply.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-2
+  TERRAFORM_VERSION: 1.5.0
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        id: init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ./terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ./terraform
+        run: terraform plan -no-color
+        continue-on-error: true
+
+      - name: Terraform Apply
+        id: apply
+        working-directory: ./terraform
+        if: steps.plan.outcome == 'success'
+        run: terraform apply -auto-approve -no-color
+
+      - name: Terraform Output
+        id: output
+        working-directory: ./terraform
+        run: terraform output -no-color
+
+      - name: Create GitHub Deployment
+        if: steps.apply.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'production',
+              description: 'Terraform apply completed',
+              auto_merge: false,
+              required_contexts: []
+            });
+        continue-on-error: true
+
+      - name: Post Apply Status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const applyStatus = `${{ steps.apply.outcome }}`;
+            const emoji = applyStatus === 'success' ? '✅' : '❌';
+            
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: applyStatus === 'success' ? 'success' : 'failure',
+              context: 'terraform/apply',
+              description: `Terraform apply ${emoji}`,
+              target_url: `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
+            });
+        continue-on-error: true
