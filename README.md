@@ -1,7 +1,6 @@
-
 # ARC + ArgoCD on EKS — Setup Guide (`github-action-runners`)
 
-Tested, working, end-to-end guide covering all three phases built so far on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file.
+Tested, working, end-to-end guide covering all five phases built on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file. **Part 4** — importing the cluster and node group into Terraform, so infra changes go through version control too. All four legs of the original plan (GitHub + ArgoCD + Terraform + EKS) are now in place. Every gotcha hit along the way is included, not just the happy path.
 
 ## Architecture recap
 
@@ -571,6 +570,219 @@ kubectl get autoscalingrunnerset arc-runner-set -n arc-runners -o jsonpath='{.sp
 
 No more `helm upgrade` needed for this kind of change — edit the file, push, and ArgoCD applies it (immediately if you force `argocd app sync`, otherwise within its ~3-minute poll interval). Note: `minRunners: 1` keeps one runner pod alive permanently rather than only during a job, which costs standing node capacity.
 
+## Part 4: Terraform — bringing the cluster and node group under Infrastructure as Code
+
+The cluster and node group were originally created by hand (AWS Console + `eksctl`/`cluster.yaml`). This part **imports** those existing resources into Terraform rather than recreating them, so future infra changes (node count, instance type, etc.) go through version control instead of manual `eksctl` commands — the last of the four legs (GitHub + ArgoCD + Terraform + EKS).
+
+### Step 24: Install Terraform
+
+```bash
+curl -O https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
+unzip terraform_1.9.8_linux_amd64.zip
+sudo mv terraform /usr/local/bin/
+terraform version
+```
+
+### Step 25: Bootstrap the remote state backend (one-time, plain AWS CLI)
+
+```bash
+aws s3api create-bucket \
+  --bucket github-action-runners-tfstate \
+  --region us-east-2 \
+  --create-bucket-configuration LocationConstraint=us-east-2
+
+aws s3api put-bucket-versioning \
+  --bucket github-action-runners-tfstate \
+  --versioning-configuration Status=Enabled
+
+aws dynamodb create-table \
+  --table-name github-action-runners-tf-lock \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region us-east-2
+```
+
+Bucket names are globally unique — pick a different one if this is taken, and use it consistently below.
+
+### Step 26: Pull the cluster and node group's exact current config
+
+```bash
+aws eks describe-cluster --name github-action-runners --region us-east-2 \
+  --query "cluster.{RoleArn:roleArn,Version:version,VpcConfig:resourcesVpcConfig}" \
+  --output json
+
+aws eks describe-nodegroup --cluster-name github-action-runners --nodegroup-name workers --region us-east-2 \
+  --query "nodegroup.{NodeRole:nodeRole,InstanceTypes:instanceTypes,AmiType:amiType,CapacityType:capacityType,DiskSize:diskSize,Subnets:subnets,ScalingConfig:scalingConfig,LaunchTemplate:launchTemplate,Tags:tags}" \
+  --output json
+```
+
+Critically, also check for an attached launch template — `eksctl`-created node groups often have one, and missing it in the Terraform config causes a destructive diff (see Step 32):
+
+```bash
+aws eks describe-nodegroup --cluster-name github-action-runners --nodegroup-name workers --region us-east-2 \
+  --query "nodegroup.launchTemplate" --output json
+```
+
+### Step 27: Write the Terraform config
+
+```bash
+mkdir -p terraform && cd terraform
+
+cat > backend.tf << 'EOF'
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  backend "s3" {
+    bucket         = "github-action-runners-tfstate"
+    key            = "eks/terraform.tfstate"
+    region         = "us-east-2"
+    dynamodb_table = "github-action-runners-tf-lock"
+    encrypt        = true
+  }
+}
+
+provider "aws" {
+  region = "us-east-2"
+}
+EOF
+
+cat > main.tf << 'EOF'
+resource "aws_eks_cluster" "this" {
+  name                           = "github-action-runners"
+  role_arn                       = "arn:aws:iam::573631993187:role/EKSGitHubActionRunnersClusterRole"
+  version                        = "1.35"
+  bootstrap_self_managed_addons  = false
+
+  vpc_config {
+    subnet_ids              = ["subnet-0c64567346e73d262", "subnet-09f84b244190d486d", "subnet-063a2dce85fd8d00d"]
+    security_group_ids      = []
+    endpoint_private_access = true
+    endpoint_public_access  = true
+    public_access_cidrs     = ["0.0.0.0/0"]
+  }
+
+  access_config {
+    authentication_mode                         = "API_AND_CONFIG_MAP"
+    bootstrap_cluster_creator_admin_permissions = true
+  }
+
+  kubernetes_network_config {
+    ip_family         = "ipv4"
+    service_ipv4_cidr = "10.100.0.0/16"
+    elastic_load_balancing {
+      enabled = false
+    }
+  }
+
+  upgrade_policy {
+    support_type = "STANDARD"
+  }
+
+  zonal_shift_config {
+    enabled = false
+  }
+
+  tags = {}
+}
+
+resource "aws_eks_node_group" "workers" {
+  cluster_name    = aws_eks_cluster.this.name
+  node_group_name = "workers"
+  node_role_arn   = "arn:aws:iam::573631993187:role/eksctl-github-action-runners-nodeg-NodeInstanceRole-rq6Xw1wnvMIY"
+  subnet_ids      = ["subnet-0c64567346e73d262", "subnet-09f84b244190d486d", "subnet-063a2dce85fd8d00d"]
+  instance_types  = ["t3.small"]
+  ami_type        = "AL2023_x86_64_STANDARD"
+  capacity_type   = "ON_DEMAND"
+
+  launch_template {
+    id      = "lt-000151662f18394c5"
+    version = "1"
+  }
+
+  labels = {
+    "alpha.eksctl.io/cluster-name"   = "github-action-runners"
+    "alpha.eksctl.io/nodegroup-name" = "workers"
+  }
+
+  tags = {
+    "alpha.eksctl.io/cluster-name"                = "github-action-runners"
+    "alpha.eksctl.io/eksctl-version"               = "0.229.0"
+    "alpha.eksctl.io/nodegroup-name"                = "workers"
+    "alpha.eksctl.io/nodegroup-type"                = "managed"
+    "eksctl.cluster.k8s.io/v1alpha1/cluster-name"  = "github-action-runners"
+  }
+
+  scaling_config {
+    desired_size = 3
+    min_size     = 3
+    max_size     = 3
+  }
+}
+EOF
+```
+
+Every value here (role ARNs, subnet IDs, security group, launch template ID/version, tags) must exactly match what Step 30 returned for *your* cluster — these are this specific cluster's real identifiers, not generic placeholders.
+
+### Step 28: Initialize and import
+
+```bash
+terraform init
+terraform import aws_eks_cluster.this github-action-runners
+terraform import aws_eks_node_group.workers github-action-runners:workers
+```
+
+### Step 29: Verify with a plan before touching anything
+
+```bash
+terraform plan
+```
+
+**Target: `0 to add, 0 to change, 0 to destroy`.** Don't run `apply` until this is clean.
+
+### Gotchas hit during this import — all baked into the config above
+
+1. **`aws_eks_cluster.this must be replaced`** with `bootstrap_self_managed_addons = false -> true # forces replacement`: this attribute wasn't declared in the initial config, so Terraform defaulted it to `true`, which differs from the real cluster (`false`) and forces a full destroy-and-recreate. **This is the single most dangerous failure mode in this whole process** — applying it would have deleted and rebuilt the entire cluster (new endpoint, new certificate authority, likely breaking ArgoCD/ARC/kubeconfig) just to change a node count. Fix: declare `bootstrap_self_managed_addons = false` explicitly.
+2. **Missing `launch_template` block**: the node group had one attached (from `eksctl`'s own provisioning) that wasn't declared, so Terraform wanted to detach it — risky, since it likely controls the node bootstrap/AMI config. Fix: declare the `launch_template` block with the real `id`/`version` from Step 30.
+3. **Missing tags/labels**: `eksctl` tags its own resources (`alpha.eksctl.io/...`, `eksctl.cluster.k8s.io/...`); omitting them from the Terraform config causes `plan` to want to strip them. Fix: mirror the exact tags/labels Step 30 returned.
+4. **`security_group_ids` diff wanting to add the cluster's own security group ID**: that ID is the **auto-created cluster security group** (exposed separately as `cluster_security_group_id`), not something that belongs in the `security_group_ids` list (which is for *additional* security groups). Fix: leave `security_group_ids = []` if the real list is empty — don't duplicate the auto-managed one in there.
+
+### Step 30: Make a real change through Terraform (confirmed working) — scale the node group
+
+```bash
+nano main.tf   # edit scaling_config: desired_size/min_size/max_size
+terraform plan  # should show only the scaling_config change
+terraform apply # type yes
+kubectl get nodes
+```
+
+**Result from this run**: scaling from 3 → 2 nodes applied cleanly through Terraform (in-place update, no replacement) once the config above was corrected.
+
+### Gotcha hit after scaling down: pod-count capacity, not CPU/memory
+
+Scaling to 2 nodes caused the ARC listener pod to get stuck `Pending` with `FailedScheduling ... Too many pods`. This is the same `t3.small` ENI/IP pod-density ceiling from the "Pod capacity reference" below (17 pods/node) — dropping a node reduces total pod capacity across the whole cluster (34 instead of 51), and between ArgoCD's 7 pods, the ARC controller, system daemonsets on every node, and everything else already running, 2 nodes wasn't enough headroom. Diagnose with:
+
+```bash
+kubectl describe pod <pending-pod> -n <namespace>   # look for "Too many pods" in Events
+kubectl get pods -A -o wide                          # see which nodes are near the 17-pod cap
+```
+
+Fix is one of: scale back to 3 nodes (fastest), move to a bigger instance type with a higher pod ceiling (e.g. `m7i-flex.large`, still free-tier eligible on this account), or enable VPC CNI prefix delegation to raise the per-node pod cap without changing instance type or count.
+
+## Pod capacity reference (3-node cluster)
+
+**maxPods = ENIs × (IPs per ENI − 1) + 2**
+
+| Instance type | Pods/node | Raw total (× 3 nodes) | Usable for workloads* |
+|---|---|---|---|
+| t3.small (3 ENIs, 6 IPs/ENI) | 17 | 51 | ~45 |
+| m7i-flex.large (upgrade path) | higher | higher | higher |
+
+\*Subtracts ~2 system daemonset pods per node (`aws-node`, `kube-proxy`). Confirm live values with `kubectl describe node <node-name> | grep -A5 Capacity`.
 
 ## Production notes
 
@@ -584,9 +796,11 @@ No more `helm upgrade` needed for this kind of change — edit the file, push, a
 
 ## What's next (not yet built)
 
-- Migrate `cluster.yaml` (currently applied by hand via `eksctl`) into Terraform with remote state, so cluster/node group changes go through version control too — the last of the four legs (GitHub + ArgoCD + Terraform + EKS).
+- Resolve the node-count vs. pod-capacity tradeoff from Step 34 with a deliberate choice (stay at 3 `t3.small` nodes, move to a bigger instance type, or enable VPC CNI prefix delegation) rather than the default of scaling back up.
+- Wire the ARC workflow to commit an image-tag bump to the `manifests/` folder on a successful build, so CI (ARC) and CD (ArgoCD) are fully connected rather than ArgoCD watching a repo nothing pushes to yet.
 - Move to an App-of-Apps ArgoCD pattern once there's more than one app/environment to manage (deliberately skipped for now — `arc-runner-set` and `argocd-demo` were each applied as standalone Applications).
 - Replace the raw `kubectl create secret` for the GitHub PAT with External Secrets Operator pulling from AWS Secrets Manager.
+- Push the `terraform/` directory (`backend.tf`, `main.tf`) into the Git repo, matching the pattern already used for `manifests/` and `arc-runner-set/`.
 
 ## Sources
 
