@@ -1,6 +1,6 @@
-# ARC + ArgoCD on EKS — Setup Guide (`github-action-runners`)
+# Building a GitOps CI/CD Pipeline on Amazon EKS: GitHub Actions Runners (ARC), ArgoCD, and Terraform
 
-Tested, working, end-to-end guide covering all five phases built on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file. **Part 4** — importing the cluster and node group into Terraform, so infra changes go through version control too. All four legs of the original plan (GitHub + ArgoCD + Terraform + EKS) are now in place. Every gotcha hit along the way is included, not just the happy path.
+Tested, working, end-to-end guide covering all four phases built on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file. **Part 4** — importing the cluster and node group into Terraform, so infra changes go through version control too. All four legs of the original plan (GitHub + ArgoCD + Terraform + EKS) are now in place.
 
 ## Architecture recap
 
@@ -8,7 +8,9 @@ Tested, working, end-to-end guide covering all five phases built on the `github-
 - **Worker nodes**: 3 × `t3.small` (2 vCPU, 2 GiB each), chosen because the AWS account is Free Tier-restricted and `t3.medium` wasn't eligible.
 - **Namespaces**: `arc-systems` (ARC controller + listener pods), `arc-runners` (ephemeral runner job pods).
 
-## Prerequisites
+## Part 1: ARC — GitHub Actions Self-Hosted Runners (CI)
+
+### Prerequisites
 
 From the AWS Console: **EKS → Clusters → github-action-runners → Connect** launches a CloudShell session with AWS CLI and kubectl already configured for the cluster — no local install needed for those two.
 
@@ -27,7 +29,7 @@ chmod +x get_helm.sh
 helm version
 ```
 
-## Step 1: Gather the cluster's VPC details
+### Step 1: Gather the cluster's VPC details
 
 This cluster was created through the AWS Console, not `eksctl` — so `eksctl` can't auto-discover its networking and needs it supplied explicitly.
 
@@ -43,7 +45,7 @@ aws ec2 describe-subnets --subnet-ids <subnet-1> <subnet-2> <subnet-3> \
   --output table
 ```
 
-## Step 2: Confirm which instance types the account can launch
+### Step 2: Confirm which instance types the account can launch
 
 ```bash
 aws ec2 describe-instance-types \
@@ -64,7 +66,7 @@ aws ec2 describe-instance-types \
 
 `t3.small` was used — same x86_64 family as originally planned, enough memory for a Docker-in-Docker runner pod. `m7i-flex.large` (8 GiB) is the upgrade path if jobs get memory-starved.
 
-## Step 3: Write the ClusterConfig file
+### Step 3: Write the ClusterConfig file
 
 ```bash
 cat > cluster.yaml << 'EOF'
@@ -98,7 +100,7 @@ EOF
 
 Fill in the real `vpc-...`, `sg-...`, and `subnet-...` values from Step 1.
 
-## Step 4: Create the nodegroup
+### Step 4: Create the nodegroup
 
 ```bash
 eksctl create nodegroup --config-file=cluster.yaml
@@ -132,7 +134,7 @@ eksctl create nodegroup --config-file=cluster.yaml
   eksctl delete nodegroup --region=us-east-2 --cluster=github-action-runners --name=workers --drain=false
   ```
 
-## Step 5: Verify the nodes
+### Step 5: Verify the nodes
 
 ```bash
 aws eks update-kubeconfig --name github-action-runners --region us-east-2
@@ -141,7 +143,7 @@ kubectl get nodes
 
 All 3 nodes should show `Ready`.
 
-## Step 6: Install the ARC controller
+### Step 6: Install the ARC controller
 
 ```bash
 NAMESPACE="arc-systems"
@@ -162,7 +164,7 @@ kubectl get deployment -n arc-systems --show-labels
 
 Look for `actions.github.com/controller-service-account-name=arc-gha-rs-controller` and `...-namespace=arc-systems`.
 
-## Step 7: Set up GitHub authentication
+### Step 7: Set up GitHub authentication
 
 ```bash
 kubectl create namespace arc-runners
@@ -173,7 +175,7 @@ kubectl create secret generic gh-pat \
 
 Classic PAT with `repo` and `admin:org` scopes (or a GitHub App for production use).
 
-## Step 8: Deploy the runner scale set
+### Step 8: Deploy the runner scale set
 
 ```bash
 cat > values-small.yaml << 'EOF'
@@ -258,7 +260,7 @@ helm install arc-runner-set \
 1. **`No gha-rs-controller deployment found using label ...`**: the chart's label-based auto-discovery of the controller failed (likely an RBAC restriction on the identity running `helm`). Fixed by adding `controllerServiceAccount.namespace`/`.name` explicitly, read straight off the controller deployment's own labels.
 2. **Duplicate/misplaced `dind` container** (ended up inside `initContainers` instead of `containers`): caused by setting `containerMode.type: "dind"` *at the same time* as a fully custom `template.spec` — the chart auto-injects its own dind pod spec and merges it with the custom one, producing duplicates. Fix: **do not set `containerMode` at all** when hand-writing the full pod template (as done above) — it's one or the other, never both.
 
-## Step 9: Verify
+### Step 9: Verify
 
 ```bash
 helm list -A
@@ -284,7 +286,7 @@ kubectl logs -n arc-systems <listener-pod-name>
 
 Healthy steady state looks like repeated `"Calculated target runner count" ... "assigned job"=0 decision=0` — this means it's authenticated with GitHub and polling normally while idle.
 
-## Step 10: Test with a real workflow — confirmed working
+### Step 10: Test with a real workflow — confirmed working
 
 `.github/workflows/arc-demo.yml` in `ajaychinthapalli/github-action-eks-runners`:
 
@@ -617,7 +619,7 @@ aws eks describe-nodegroup --cluster-name github-action-runners --nodegroup-name
   --output json
 ```
 
-Critically, also check for an attached launch template — `eksctl`-created node groups often have one, and missing it in the Terraform config causes a destructive diff (see Step 32):
+Critically, also check for an attached launch template — `eksctl`-created node groups often have one, and missing it in the Terraform config causes a destructive diff (see Step 28):
 
 ```bash
 aws eks describe-nodegroup --cluster-name github-action-runners --nodegroup-name workers --region us-east-2 \
@@ -726,7 +728,7 @@ resource "aws_eks_node_group" "workers" {
 EOF
 ```
 
-Every value here (role ARNs, subnet IDs, security group, launch template ID/version, tags) must exactly match what Step 30 returned for *your* cluster — these are this specific cluster's real identifiers, not generic placeholders.
+Every value here (role ARNs, subnet IDs, security group, launch template ID/version, tags) must exactly match what Step 26 returned for *your* cluster — these are this specific cluster's real identifiers, not generic placeholders.
 
 ### Step 28: Initialize and import
 
@@ -747,8 +749,8 @@ terraform plan
 ### Gotchas hit during this import — all baked into the config above
 
 1. **`aws_eks_cluster.this must be replaced`** with `bootstrap_self_managed_addons = false -> true # forces replacement`: this attribute wasn't declared in the initial config, so Terraform defaulted it to `true`, which differs from the real cluster (`false`) and forces a full destroy-and-recreate. **This is the single most dangerous failure mode in this whole process** — applying it would have deleted and rebuilt the entire cluster (new endpoint, new certificate authority, likely breaking ArgoCD/ARC/kubeconfig) just to change a node count. Fix: declare `bootstrap_self_managed_addons = false` explicitly.
-2. **Missing `launch_template` block**: the node group had one attached (from `eksctl`'s own provisioning) that wasn't declared, so Terraform wanted to detach it — risky, since it likely controls the node bootstrap/AMI config. Fix: declare the `launch_template` block with the real `id`/`version` from Step 30.
-3. **Missing tags/labels**: `eksctl` tags its own resources (`alpha.eksctl.io/...`, `eksctl.cluster.k8s.io/...`); omitting them from the Terraform config causes `plan` to want to strip them. Fix: mirror the exact tags/labels Step 30 returned.
+2. **Missing `launch_template` block**: the node group had one attached (from `eksctl`'s own provisioning) that wasn't declared, so Terraform wanted to detach it — risky, since it likely controls the node bootstrap/AMI config. Fix: declare the `launch_template` block with the real `id`/`version` from Step 26.
+3. **Missing tags/labels**: `eksctl` tags its own resources (`alpha.eksctl.io/...`, `eksctl.cluster.k8s.io/...`); omitting them from the Terraform config causes `plan` to want to strip them. Fix: mirror the exact tags/labels Step 26 returned.
 4. **`security_group_ids` diff wanting to add the cluster's own security group ID**: that ID is the **auto-created cluster security group** (exposed separately as `cluster_security_group_id`), not something that belongs in the `security_group_ids` list (which is for *additional* security groups). Fix: leave `security_group_ids = []` if the real list is empty — don't duplicate the auto-managed one in there.
 
 ### Step 30: Make a real change through Terraform (confirmed working) — scale the node group
@@ -796,7 +798,7 @@ Fix is one of: scale back to 3 nodes (fastest), move to a bigger instance type w
 
 ## What's next (not yet built)
 
-- Resolve the node-count vs. pod-capacity tradeoff from Step 34 with a deliberate choice (stay at 3 `t3.small` nodes, move to a bigger instance type, or enable VPC CNI prefix delegation) rather than the default of scaling back up.
+- Resolve the node-count vs. pod-capacity tradeoff from Step 30 with a deliberate choice (stay at 3 `t3.small` nodes, move to a bigger instance type, or enable VPC CNI prefix delegation) rather than the default of scaling back up.
 - Wire the ARC workflow to commit an image-tag bump to the `manifests/` folder on a successful build, so CI (ARC) and CD (ArgoCD) are fully connected rather than ArgoCD watching a repo nothing pushes to yet.
 - Move to an App-of-Apps ArgoCD pattern once there's more than one app/environment to manage (deliberately skipped for now — `arc-runner-set` and `argocd-demo` were each applied as standalone Applications).
 - Replace the raw `kubectl create secret` for the GitHub PAT with External Secrets Operator pulling from AWS Secrets Manager.
