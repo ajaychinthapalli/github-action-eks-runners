@@ -6,8 +6,8 @@ controllerServiceAccount:
   namespace: arc-systems
   name: arc-gha-rs-controller
 
-minRunners: 10
-maxRunners: 15
+minRunners: 0
+maxRunners: 5
 
 template:
   spec:
