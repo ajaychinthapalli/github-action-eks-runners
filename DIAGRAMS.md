@@ -138,7 +138,7 @@ The workflow of how GitHub Actions jobs are processed:
 sequenceDiagram
     actor Dev as Developer
     participant GH as GitHub
-    participant PAT as GitHub API<br/>(PAT Auth)
+    participant PAT as GitHub API
     participant ARC as ARC Controller
     participant Runner as Runner Pod
     participant Docker as Docker Registry
@@ -511,10 +511,10 @@ How Terraform authenticates to AWS without storing credentials:
 ```mermaid
 sequenceDiagram
     actor GHA as GitHub Actions
-    participant OpenIDConnect as OpenID Connect<br/>(GitHub)
+    participant OpenIDConnect as OpenID Connect
     participant AWS as AWS STS
     participant IAM as AWS IAM
-    participant S3 as AWS S3<br/>Terraform State
+    participant S3 as AWS S3 State
     
     GHA->>+OpenIDConnect: Request token
     Note over OpenIDConnect: Sign token with<br/>GitHub private key
