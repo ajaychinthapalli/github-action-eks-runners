@@ -12,7 +12,6 @@ High-level overview of how all components interact:
 graph TB
     subgraph "GitHub"
         GH["GitHub Repository<br/>with Workflows"]
-        GHAPP["GitHub App<br/>Actions Runner Controller"]
     end
     
     subgraph "AWS Cloud"
@@ -54,12 +53,12 @@ graph TB
         Docker["Docker Registry"]
     end
     
-    GH -->|OIDC Token| IAM
-    GH -->|Pull Job Requests| ARC
+    GH -->|Webhook Event<br/>(PAT Auth)| Listener
+    GH -->|Job Status Updates<br/>(PAT Auth)| ARC
     ARC -->|Create/Manage| Runner1
     ARC -->|Create/Manage| Runner2
     ARC -->|Create/Manage| RunnerN
-    Runner1 -->|Execute Workflow| GHAPP
+    Runner1 -->|Report Status<br/>(PAT Auth)| GH
     EKS -->|Manages| Node1
     EKS -->|Manages| Node2
     EKS -->|Manages| Node3
@@ -67,7 +66,6 @@ graph TB
     CA -->|Auto-scales| Node2
     CA -->|Auto-scales| Node3
     ArgoCD -->|Deploy| ARC
-    ArgoCD -->|Sync Config| GHAPP
     Docker -->|Pull Images| Runner1
     IAM -->|IRSA| CA
     S3 -->|State| IAM
@@ -140,31 +138,31 @@ The workflow of how GitHub Actions jobs are processed:
 sequenceDiagram
     actor Dev as Developer
     participant GH as GitHub
-    participant GHAPP as GitHub App
+    participant PAT as GitHub API<br/>(PAT Auth)
     participant ARC as ARC Controller
     participant Runner as Runner Pod
     participant Docker as Docker Registry
     participant App as Application
     
     Dev->>GH: Push code / Create PR
-    GH->>GHAPP: Trigger workflow (webhook)
-    Note over GHAPP: Workflow queued
-    GHAPP->>ARC: Check runner capacity
+    GH->>PAT: Trigger workflow (webhook)
+    Note over PAT: Workflow queued
+    PAT->>ARC: Check runner capacity (PAT)
     alt Runners available
         ARC->>Runner: Create new runner pod
         Note over Runner: Pod initializes
-        Runner->>GHAPP: Register runner
+        Runner->>PAT: Register runner (PAT)
     else No runners available
         ARC->>ARC: Scale up (pending pods trigger CA)
         Note over ARC: Wait for node scaling
     end
-    GHAPP->>Runner: Assign job to runner
+    PAT->>Runner: Assign job to runner (PAT)
     Runner->>Runner: Run checkout@v3
     Runner->>Docker: Pull action images
     Docker-->>Runner: Return image layers
     Runner->>App: Execute build/test steps
     App-->>Runner: Return results
-    Runner->>GH: Report job status
+    Runner->>GH: Report job status (PAT)
     Note over GH: Job complete
     ARC->>Runner: Pod TTL expired, delete
     Note over Runner: Pod termination
@@ -355,6 +353,7 @@ graph LR
         Workflow["Workflow YAML<br/>(.github/workflows/)"]
         Secrets["GitHub Secrets<br/>(encrypted)"]
         Webhook["Webhook Event<br/>job queued"]
+        PAT["Personal Access Token<br/>(for API calls)"]
     end
     
     subgraph "ARC on EKS"
@@ -373,12 +372,12 @@ graph LR
     subgraph "Storage & Auth"
         Actions["GitHub Actions<br/>Docker Image"]
         Tools["Pre-installed Tools<br/>git, npm, etc."]
-        GHToken["GitHub Token<br/>(for git operations)"]
+        GHToken["GitHub Token (PAT)<br/>(for git operations)"]
     end
     
     Workflow -->|triggers| Webhook
     Secrets -->|inject| RunnerPod
-    Webhook -->|poll| Listener
+    Webhook -->|poll with PAT| Listener
     Listener -->|scale| Controller
     ScaleConfig -->|limit| Controller
     Controller -->|create| RunnerPod
@@ -388,7 +387,8 @@ graph LR
     RunnerPod -->|executes| UserSteps
     UserSteps -->|use| Tools
     UserSteps -->|report| Teardown
-    Teardown -->|status| Webhook
+    Teardown -->|status with PAT| Webhook
+    PAT -->|authenticate API calls| Listener
 ```
 
 ---
