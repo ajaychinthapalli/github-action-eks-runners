@@ -1,71 +1,45 @@
-resource "aws_eks_cluster" "this" {
-  name                           = "github-action-runners"
-  role_arn                       = "arn:aws:iam::573631993187:role/EKSGitHubActionRunnersClusterRole"
-  version                        = "1.35"
-  bootstrap_self_managed_addons  = false
+module "eks" {
+  source = "./modules/eks"
 
-  vpc_config {
-    subnet_ids              = ["subnet-0c64567346e73d262", "subnet-09f84b244190d486d", "subnet-063a2dce85fd8d00d"]
-    security_group_ids      = []
-    endpoint_private_access = true
-    endpoint_public_access  = true
-    public_access_cidrs     = ["0.0.0.0/0"]
-  }
-
-  access_config {
-    authentication_mode                         = "API_AND_CONFIG_MAP"
-    bootstrap_cluster_creator_admin_permissions = true
-  }
-
-  kubernetes_network_config {
-    ip_family         = "ipv4"
-    service_ipv4_cidr = "10.100.0.0/16"
-    elastic_load_balancing {
-      enabled = false
-    }
-  }
-
-  upgrade_policy {
-    support_type = "STANDARD"
-  }
-
-  zonal_shift_config {
-    enabled = false
-  }
-
-  tags = {}
+  cluster_name              = var.cluster_name
+  cluster_version           = var.cluster_version
+  region                    = var.region
+  vpc_id                    = var.vpc_id
+  cluster_security_group_id = var.cluster_security_group_id
+  subnet_ids                = var.subnet_ids
+  cluster_role_arn          = var.cluster_role_arn
+  node_role_arn             = var.node_role_arn
+  node_group_name           = var.node_group_name
+  node_instance_type        = var.node_instance_type
+  node_desired_size         = var.node_desired_size
+  node_min_size             = var.node_min_size
+  node_max_size             = var.node_max_size
+  node_capacity_type        = var.node_capacity_type
+  launch_template_id        = var.launch_template_id
+  launch_template_version   = var.launch_template_version
+  tags                      = var.tags
 }
 
-resource "aws_eks_node_group" "workers" {
-  cluster_name    = aws_eks_cluster.this.name
-  node_group_name = "workers"
-  node_role_arn   = "arn:aws:iam::573631993187:role/eksctl-github-action-runners-nodeg-NodeInstanceRole-rq6Xw1wnvMIY"
-  subnet_ids      = ["subnet-0c64567346e73d262", "subnet-09f84b244190d486d", "subnet-063a2dce85fd8d00d"]
-  instance_types  = ["t3.small"]
-  ami_type        = "AL2023_x86_64_STANDARD"
-  capacity_type   = "ON_DEMAND"
+module "cluster_autoscaler" {
+  source = "./modules/cluster-autoscaler"
 
-  launch_template {
-    id      = "lt-000151662f18394c5"
-    version = "1"
-  }
+  cluster_name           = module.eks.cluster_id
+  cluster_endpoint       = module.eks.cluster_endpoint
+  cluster_ca_certificate = module.eks.cluster_certificate_authority_data
+  cluster_auth_token     = data.aws_eks_auth.cluster.token
+  cluster_oidc_issuer_url = module.eks.cluster_oidc_issuer_url
+  oidc_provider_arn      = data.aws_iam_openid_connect_provider.eks.arn
+  tags                   = var.tags
 
-  labels = {
-    "alpha.eksctl.io/cluster-name"   = "github-action-runners"
-    "alpha.eksctl.io/nodegroup-name" = "workers"
-  }
-
-  tags = {
-    "alpha.eksctl.io/cluster-name"                = "github-action-runners"
-    "alpha.eksctl.io/eksctl-version"               = "0.229.0"
-    "alpha.eksctl.io/nodegroup-name"                = "workers"
-    "alpha.eksctl.io/nodegroup-type"                = "managed"
-    "eksctl.cluster.k8s.io/v1alpha1/cluster-name"  = "github-action-runners"
-  }
-
-  scaling_config {
-    desired_size = 4
-    min_size     = 4
-    max_size     = 4
-  }
+  depends_on = [module.eks]
 }
+
+# Get OIDC provider details
+data "aws_iam_openid_connect_provider" "eks" {
+  arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${replace(module.eks.cluster_oidc_issuer_url, "https://", "")}"
+
+  depends_on = [module.eks]
+}
+
+data "aws_caller_identity" "current" {}
+

@@ -44,47 +44,94 @@ jobs:
         id: init
         working-directory: ./terraform
         run: terraform init
+                    continue-on-error: true
 
-      - name: Terraform Validate
-        id: validate
-        working-directory: ./terraform
-        run: terraform validate
+                  - name: Terraform Validate
+                    id: validate
+                    working-directory: ./terraform
+                    run: terraform validate
+                    continue-on-error: true
 
-      - name: Terraform Plan
-        id: plan
-        working-directory: ./terraform
-        run: terraform plan -no-color -out=tfplan
-        continue-on-error: true
+                  - name: Terraform Plan
+                    id: plan
+                    working-directory: ./terraform
+                    run: |
+                      terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt
+                      echo "exit_code=$?" >> $GITHUB_OUTPUT
+                    continue-on-error: true
 
-      - name: Comment Plan on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const planOutput = '${{ steps.plan.outputs.stdout }}';
+                  - name: Extract and Format Plan Output
+                    id: plan_output
+                    if: always()
+                    working-directory: ./terraform
+                    run: |
+                      # Extract the plan summary (last 50 lines usually contain the summary)
+                      if [ -f plan.txt ]; then
+                        PLAN_OUTPUT=$(tail -n 50 plan.txt)
+                      else
+                        PLAN_OUTPUT="Plan output not available"
+                      fi
+          
+                      # Escape newlines for GitHub Actions
+                      PLAN_OUTPUT="${PLAN_OUTPUT//'%'/'%25'}"
+                      PLAN_OUTPUT="${PLAN_OUTPUT//$'\n'/'%0A'}"
+                      PLAN_OUTPUT="${PLAN_OUTPUT//$'\r'/'%0D'}"
+          
+                      echo "plan_text=$PLAN_OUTPUT" >> $GITHUB_OUTPUT
+
+                  - name: Comment Plan on PR
+                    if: github.event_name == 'pull_request' && always()
+                    uses: actions/github-script@v7
+                    with:
+                      script: |
+                        const fmt_status = "${{ steps.fmt.outcome }}" === "success" ? "✅" : "⚠️";
+                        const init_status = "${{ steps.init.outcome }}" === "success" ? "✅" : "❌";
+                        const validate_status = "${{ steps.validate.outcome }}" === "success" ? "✅" : "❌";
+                        const plan_status = "${{ steps.plan.outcome }}" === "success" ? "✅" : "⚠️";
             
-            const comment = `## Terraform Plan
+                        const plan_output = `${{ steps.plan_output.outputs.plan_text }}`.substring(0, 60000);
             
+                        const comment = `## Terraform Plan Report
+            
+            | Check | Status |
+            |-------|--------|
+            | Format | ${fmt_status} |
+            | Init | ${init_status} |
+            | Validate | ${validate_status} |
+            | Plan | ${plan_status} |
+
+            ### Plan Output
             \`\`\`
-            ${ planOutput || 'Plan output not available' }
+            ${plan_output || 'Plan output not available'}
             \`\`\`
-            
-            **Validate Status**: ${{ steps.validate.outcome }}
-            **Plan Status**: ${{ steps.plan.outcome }}`;
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
-        continue-on-error: true
 
-      - name: Save Plan Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-plan
-          path: terraform/tfplan
-          retention-days: 1
+            **Actions Required:**
+            - Review the plan output above for any unexpected changes
+            - Ensure all resource changes are intentional before merge
+            - Run \`terraform apply\` after merge to apply the changes`;
+            
+                        github.rest.issues.createComment({
+                          issue_number: context.issue.number,
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          body: comment
+                        });
+
+                  - name: Save Plan Artifact
+                    if: always()
+                    uses: actions/upload-artifact@v4
+                    with:
+                      name: terraform-plan
+                      path: terraform/tfplan
+                      retention-days: 5
+                      if-no-files-found: ignore
+
+                  - name: Save Plan Output Artifact
+                    if: always()
+                    uses: actions/upload-artifact@v4
+                    with:
+                      name: terraform-plan-output
+                      path: terraform/plan.txt
+                      retention-days: 5
+                      if-no-files-found: ignore
+
