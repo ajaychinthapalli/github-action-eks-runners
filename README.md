@@ -2,6 +2,48 @@
 
 Tested, working, end-to-end guide covering all four phases built on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file. **Part 4** — importing the cluster and node group into Terraform, so infra changes go through version control too. All four legs of the original plan (GitHub + ArgoCD + Terraform + EKS) are now in place.
 
+## 📚 Documentation
+
+This repository has been reorganized with modular Terraform and comprehensive scaling guides. Start here:
+
+- **[TERRAFORM.md](./TERRAFORM.md)** - Terraform infrastructure setup, file structure, and common tasks
+- **[SCALING.md](./SCALING.md)** - Complete guide to scaling runners and nodes, cost estimation
+- **[SPOT_INSTANCES.md](./SPOT_INSTANCES.md)** - Cost optimization using AWS Spot instances (up to 70% savings)
+- **[terraform/modules/README.md](./terraform/modules/README.md)** - Terraform modules documentation
+
+## Quick Start
+
+1. **Update Terraform configuration:**
+   ```bash
+   cd terraform
+   vim terraform.tfvars  # Fill in your AWS IDs
+   ```
+
+2. **Deploy infrastructure:**
+   ```bash
+   terraform init
+   terraform plan
+   terraform apply
+   ```
+
+3. **Configure kubectl:**
+   ```bash
+   $(terraform output -raw configure_kubectl)
+   ```
+
+See [TERRAFORM.md](./TERRAFORM.md) for detailed setup instructions.
+
+## Key Improvements
+
+✅ **Modular Terraform** - Reusable modules for EKS and Cluster Autoscaler  
+✅ **No Hardcoded Values** - All IDs in variables.tfvars  
+✅ **Automatic Scaling** - Cluster Autoscaler deploys with Terraform  
+✅ **Spot Instance Support** - Reduce costs by 70% with optional Spot instances  
+✅ **Better CI/CD** - Enhanced Terraform plan workflow with improved PR comments  
+✅ **Comprehensive Docs** - Scaling, cost optimization, and infrastructure guides  
+
+
+
 ## Architecture recap
 
 - **Master nodes**: none to provision. EKS is a managed service — AWS runs the control plane (API server, etcd, scheduler) across multiple AZs.
