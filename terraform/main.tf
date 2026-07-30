@@ -1,12 +1,12 @@
 resource "aws_eks_cluster" "this" {
-  name                           = "github-action-runners"
-  role_arn                       = "arn:aws:iam::573631993187:role/EKSGitHubActionRunnersClusterRole"
-  version                        = "1.35"
+  name                           = var.cluster_name
+  role_arn                       = var.cluster_role_arn
+  version                        = var.cluster_version
   bootstrap_self_managed_addons  = false
 
   vpc_config {
-    subnet_ids              = ["subnet-0c64567346e73d262", "subnet-09f84b244190d486d", "subnet-063a2dce85fd8d00d"]
-    security_group_ids      = []
+    subnet_ids              = var.subnet_ids
+    security_group_ids      = var.cluster_security_group_id != "" ? [var.cluster_security_group_id] : []
     endpoint_private_access = true
     endpoint_public_access  = true
     public_access_cidrs     = ["0.0.0.0/0"]
@@ -33,39 +33,43 @@ resource "aws_eks_cluster" "this" {
     enabled = false
   }
 
-  tags = {}
+  tags = var.tags
 }
 
 resource "aws_eks_node_group" "workers" {
   cluster_name    = aws_eks_cluster.this.name
-  node_group_name = "workers"
-  node_role_arn   = "arn:aws:iam::573631993187:role/eksctl-github-action-runners-nodeg-NodeInstanceRole-rq6Xw1wnvMIY"
-  subnet_ids      = ["subnet-0c64567346e73d262", "subnet-09f84b244190d486d", "subnet-063a2dce85fd8d00d"]
-  instance_types  = ["t3.small"]
+  node_group_name = var.node_group_name
+  node_role_arn   = var.node_role_arn
+  subnet_ids      = var.subnet_ids
+  instance_types  = [var.node_instance_type]
   ami_type        = "AL2023_x86_64_STANDARD"
-  capacity_type   = "ON_DEMAND"
+  capacity_type   = var.node_capacity_type
 
   launch_template {
-    id      = "lt-000151662f18394c5"
-    version = "1"
+    id      = var.launch_template_id
+    version = var.launch_template_version
   }
 
   labels = {
-    "alpha.eksctl.io/cluster-name"   = "github-action-runners"
-    "alpha.eksctl.io/nodegroup-name" = "workers"
+    "alpha.eksctl.io/cluster-name"   = var.cluster_name
+    "alpha.eksctl.io/nodegroup-name" = var.node_group_name
   }
 
-  tags = {
-    "alpha.eksctl.io/cluster-name"                = "github-action-runners"
-    "alpha.eksctl.io/eksctl-version"               = "0.229.0"
-    "alpha.eksctl.io/nodegroup-name"                = "workers"
-    "alpha.eksctl.io/nodegroup-type"                = "managed"
-    "eksctl.cluster.k8s.io/v1alpha1/cluster-name"  = "github-action-runners"
-  }
+  tags = merge(
+    var.tags,
+    {
+      "alpha.eksctl.io/cluster-name"               = var.cluster_name
+      "alpha.eksctl.io/nodegroup-name"             = var.node_group_name
+      "alpha.eksctl.io/nodegroup-type"             = "managed"
+      "eksctl.cluster.k8s.io/v1alpha1/cluster-name" = var.cluster_name
+    }
+  )
 
   scaling_config {
-    desired_size = 4
-    min_size     = 4
-    max_size     = 4
+    desired_size = var.node_desired_size
+    min_size     = var.node_min_size
+    max_size     = var.node_max_size
   }
+
+  depends_on = [aws_eks_cluster.this]
 }

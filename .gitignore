@@ -7,6 +7,9 @@
 !example.tfvars.json
 .terraform/
 .terraform.lock.hcl
+*.tfplan
+terraform/tfplan
+
 
 # IDE files
 .idea/
