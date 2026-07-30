@@ -1,11 +1,20 @@
-# Cluster Autoscaler deployment for automatic node scaling
-# This allows the cluster to scale down underutilized nodes and scale up when needed
+terraform {
+  required_providers {
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
+    }
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
 
 resource "kubernetes_namespace" "cluster_autoscaler" {
   metadata {
-    name = "kube-system"
+    name = var.namespace
   }
-  depends_on = [aws_eks_cluster.this]
 }
 
 resource "kubernetes_service_account" "cluster_autoscaler" {
@@ -125,6 +134,9 @@ resource "kubernetes_deployment" "cluster_autoscaler" {
   metadata {
     name      = "cluster-autoscaler"
     namespace = kubernetes_namespace.cluster_autoscaler.metadata[0].name
+    labels = {
+      app = "cluster-autoscaler"
+    }
   }
 
   spec {
@@ -200,17 +212,10 @@ resource "kubernetes_deployment" "cluster_autoscaler" {
     }
   }
 
-  depends_on = [
-    kubernetes_cluster_role_binding.cluster_autoscaler,
-    aws_eks_node_group.workers
-  ]
+  depends_on = [kubernetes_cluster_role_binding.cluster_autoscaler]
 }
 
 # IAM role for Cluster Autoscaler with OIDC
-data "aws_iam_openid_connect_provider" "eks" {
-  arn = aws_eks_cluster.this.identity[0].oidc[0].issuer
-}
-
 resource "aws_iam_role" "cluster_autoscaler" {
   name = "${var.cluster_name}-cluster-autoscaler"
 
@@ -221,16 +226,18 @@ resource "aws_iam_role" "cluster_autoscaler" {
         Action = "sts:AssumeRoleWithWebIdentity"
         Effect = "Allow"
         Principal = {
-          Federated = data.aws_iam_openid_connect_provider.eks.arn
+          Federated = var.oidc_provider_arn
         }
         Condition = {
           StringEquals = {
-            "${replace(aws_eks_cluster.this.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:kube-system:cluster-autoscaler"
+            "${replace(var.cluster_oidc_issuer_url, "https://", "")}:sub" = "system:serviceaccount:${var.namespace}:cluster-autoscaler"
           }
         }
       }
     ]
   })
+
+  tags = var.tags
 }
 
 resource "aws_iam_role_policy" "cluster_autoscaler" {

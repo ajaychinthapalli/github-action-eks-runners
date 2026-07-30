@@ -1,75 +1,45 @@
-resource "aws_eks_cluster" "this" {
-  name                           = var.cluster_name
-  role_arn                       = var.cluster_role_arn
-  version                        = var.cluster_version
-  bootstrap_self_managed_addons  = false
+module "eks" {
+  source = "./modules/eks"
 
-  vpc_config {
-    subnet_ids              = var.subnet_ids
-    security_group_ids      = var.cluster_security_group_id != "" ? [var.cluster_security_group_id] : []
-    endpoint_private_access = true
-    endpoint_public_access  = true
-    public_access_cidrs     = ["0.0.0.0/0"]
-  }
-
-  access_config {
-    authentication_mode                         = "API_AND_CONFIG_MAP"
-    bootstrap_cluster_creator_admin_permissions = true
-  }
-
-  kubernetes_network_config {
-    ip_family         = "ipv4"
-    service_ipv4_cidr = "10.100.0.0/16"
-    elastic_load_balancing {
-      enabled = false
-    }
-  }
-
-  upgrade_policy {
-    support_type = "STANDARD"
-  }
-
-  zonal_shift_config {
-    enabled = false
-  }
-
-  tags = var.tags
+  cluster_name              = var.cluster_name
+  cluster_version           = var.cluster_version
+  region                    = var.region
+  vpc_id                    = var.vpc_id
+  cluster_security_group_id = var.cluster_security_group_id
+  subnet_ids                = var.subnet_ids
+  cluster_role_arn          = var.cluster_role_arn
+  node_role_arn             = var.node_role_arn
+  node_group_name           = var.node_group_name
+  node_instance_type        = var.node_instance_type
+  node_desired_size         = var.node_desired_size
+  node_min_size             = var.node_min_size
+  node_max_size             = var.node_max_size
+  node_capacity_type        = var.node_capacity_type
+  launch_template_id        = var.launch_template_id
+  launch_template_version   = var.launch_template_version
+  tags                      = var.tags
 }
 
-resource "aws_eks_node_group" "workers" {
-  cluster_name    = aws_eks_cluster.this.name
-  node_group_name = var.node_group_name
-  node_role_arn   = var.node_role_arn
-  subnet_ids      = var.subnet_ids
-  instance_types  = [var.node_instance_type]
-  ami_type        = "AL2023_x86_64_STANDARD"
-  capacity_type   = var.node_capacity_type
+module "cluster_autoscaler" {
+  source = "./modules/cluster-autoscaler"
 
-  launch_template {
-    id      = var.launch_template_id
-    version = var.launch_template_version
-  }
+  cluster_name           = module.eks.cluster_id
+  cluster_endpoint       = module.eks.cluster_endpoint
+  cluster_ca_certificate = module.eks.cluster_certificate_authority_data
+  cluster_auth_token     = data.aws_eks_auth.cluster.token
+  cluster_oidc_issuer_url = module.eks.cluster_oidc_issuer_url
+  oidc_provider_arn      = data.aws_iam_openid_connect_provider.eks.arn
+  tags                   = var.tags
 
-  labels = {
-    "alpha.eksctl.io/cluster-name"   = var.cluster_name
-    "alpha.eksctl.io/nodegroup-name" = var.node_group_name
-  }
-
-  tags = merge(
-    var.tags,
-    {
-      "alpha.eksctl.io/cluster-name"               = var.cluster_name
-      "alpha.eksctl.io/nodegroup-name"             = var.node_group_name
-      "alpha.eksctl.io/nodegroup-type"             = "managed"
-      "eksctl.cluster.k8s.io/v1alpha1/cluster-name" = var.cluster_name
-    }
-  )
-
-  scaling_config {
-    desired_size = var.node_desired_size
-    min_size     = var.node_min_size
-    max_size     = var.node_max_size
-  }
-
-  depends_on = [aws_eks_cluster.this]
+  depends_on = [module.eks]
 }
+
+# Get OIDC provider details
+data "aws_iam_openid_connect_provider" "eks" {
+  arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${replace(module.eks.cluster_oidc_issuer_url, "https://", "")}"
+
+  depends_on = [module.eks]
+}
+
+data "aws_caller_identity" "current" {}
+
