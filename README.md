@@ -1,48 +1,6 @@
 # Building a GitOps CI/CD Pipeline on Amazon EKS: GitHub Actions Runners (ARC), ArgoCD, and Terraform
 
-Tested, working, end-to-end guide covering all four phases built on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file. **Part 4** — importing the cluster and node group into Terraform, so infra changes go through version control too. All four legs of the original plan (GitHub + ArgoCD + Terraform + EKS) are now in place.
-
-## 📚 Documentation
-
-This repository has been reorganized with modular Terraform and comprehensive scaling guides. Start here:
-
-- **[TERRAFORM.md](./TERRAFORM.md)** - Terraform infrastructure setup, file structure, and common tasks
-- **[SCALING.md](./SCALING.md)** - Complete guide to scaling runners and nodes, cost estimation
-- **[SPOT_INSTANCES.md](./SPOT_INSTANCES.md)** - Cost optimization using AWS Spot instances (up to 70% savings)
-- **[terraform/modules/README.md](./terraform/modules/README.md)** - Terraform modules documentation
-
-## Quick Start
-
-1. **Update Terraform configuration:**
-   ```bash
-   cd terraform
-   vim terraform.tfvars  # Fill in your AWS IDs
-   ```
-
-2. **Deploy infrastructure:**
-   ```bash
-   terraform init
-   terraform plan
-   terraform apply
-   ```
-
-3. **Configure kubectl:**
-   ```bash
-   $(terraform output -raw configure_kubectl)
-   ```
-
-See [TERRAFORM.md](./TERRAFORM.md) for detailed setup instructions.
-
-## Key Improvements
-
-✅ **Modular Terraform** - Reusable modules for EKS and Cluster Autoscaler  
-✅ **No Hardcoded Values** - All IDs in variables.tfvars  
-✅ **Automatic Scaling** - Cluster Autoscaler deploys with Terraform  
-✅ **Spot Instance Support** - Reduce costs by 70% with optional Spot instances  
-✅ **Better CI/CD** - Enhanced Terraform plan workflow with improved PR comments  
-✅ **Comprehensive Docs** - Scaling, cost optimization, and infrastructure guides  
-
-
+Tested, working, end-to-end guide covering all five phases built on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file. **Part 4** — importing the cluster and node group into Terraform, so infra changes go through version control too. **Part 5** — replacing the manually-created GitHub PAT secret with AWS Secrets Manager, synced into the cluster via External Secrets Operator (ESO). All four legs of the original plan (GitHub + ArgoCD + Terraform + EKS) are in place, plus this secrets-management hardening on top. Every gotcha hit along the way is included, not just the happy path.
 
 ## Architecture recap
 
@@ -216,6 +174,8 @@ kubectl create secret generic gh-pat \
 ```
 
 Classic PAT with `repo` and `admin:org` scopes (or a GitHub App for production use).
+
+> Superseded in Part 5: this manually-created secret is later replaced with one synced automatically from AWS Secrets Manager via External Secrets Operator, so the PAT itself never has to be typed into `kubectl` again.
 
 ### Step 8: Deploy the runner scale set
 
@@ -541,7 +501,7 @@ git commit -m "Add ARC runner scale set values for GitOps"
 git push
 ```
 
-`githubConfigSecret: gh-pat` inside this file is safe to commit — it's only a reference to the *name* of a Kubernetes Secret that already exists in `arc-runners`, not the PAT value itself. That secret is created separately via `kubectl create secret` and isn't tracked in Git, so it needs to be recreated by hand if it's ever deleted — a good candidate for External Secrets Operator later (see "What's next").
+`githubConfigSecret: gh-pat` inside this file is safe to commit — it's only a reference to the *name* of a Kubernetes Secret that already exists in `arc-runners`, not the PAT value itself. At this point that secret is still created manually via `kubectl create secret` and isn't tracked in Git, so it needs to be recreated by hand if it's ever deleted. Part 5 replaces this with External Secrets Operator pulling from AWS Secrets Manager, so nothing about the value has to be typed in by hand again.
 
 ### Step 20: Uninstall the manual Helm release
 
@@ -817,6 +777,159 @@ kubectl get pods -A -o wide                          # see which nodes are near 
 
 Fix is one of: scale back to 3 nodes (fastest), move to a bigger instance type with a higher pod ceiling (e.g. `m7i-flex.large`, still free-tier eligible on this account), or enable VPC CNI prefix delegation to raise the per-node pod cap without changing instance type or count.
 
+## Part 5: AWS Secrets Manager — externalizing the GitHub PAT via External Secrets Operator
+
+The `gh-pat` secret from Step 7 has been a manually-typed `kubectl create secret` ever since — not tracked in Git, and gone for good if it's ever accidentally deleted. This part moves the actual PAT value into AWS Secrets Manager and uses External Secrets Operator (ESO) to sync it into the cluster automatically, authenticating via IRSA (IAM Roles for Service Accounts) rather than any static AWS key.
+
+### Step 31: Store the PAT in AWS Secrets Manager
+
+```bash
+aws secretsmanager create-secret \
+  --name github-action-runners/gh-pat \
+  --region us-east-2 \
+  --secret-string '{"github_token":"<YOUR_PAT>"}'
+```
+
+### Step 32: Set up IRSA for ESO
+
+```bash
+# One-time per cluster — skip if already associated
+eksctl utils associate-iam-oidc-provider \
+  --cluster github-action-runners --region us-east-2 --approve
+
+kubectl create namespace external-secrets
+```
+
+Create an IAM policy scoped to just this one secret:
+
+```bash
+cat > eso-secretsmanager-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+      "Resource": "arn:aws:secretsmanager:us-east-2:573631993187:secret:github-action-runners/gh-pat-*"
+    }
+  ]
+}
+EOF
+
+aws iam create-policy \
+  --policy-name ExternalSecretsGhPatRead \
+  --policy-document file://eso-secretsmanager-policy.json
+```
+
+Create the IRSA-backed service account ESO will run as:
+
+```bash
+eksctl create iamserviceaccount \
+  --name external-secrets-sa \
+  --namespace external-secrets \
+  --cluster github-action-runners \
+  --region us-east-2 \
+  --attach-policy-arn arn:aws:iam::573631993187:policy/ExternalSecretsGhPatRead \
+  --approve
+```
+
+### Step 33: Install External Secrets Operator via Helm
+
+```bash
+helm repo add external-secrets https://charts.external-secrets.io
+helm repo update
+
+helm install external-secrets external-secrets/external-secrets \
+  --namespace external-secrets \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=external-secrets-sa
+```
+
+`serviceAccount.create=false` tells the chart to use the IRSA-annotated service account from Step 32 instead of creating its own plain one.
+
+### Step 34: Confirm which CRD apiVersion is actually installed
+
+```bash
+kubectl get crd secretstores.external-secrets.io -o jsonpath='{.spec.versions[*].name}{"\n"}'
+kubectl get crd clustersecretstores.external-secrets.io -o jsonpath='{.spec.versions[*].name}{"\n"}'
+```
+
+Use whichever version name this actually returns (`v1` or `v1beta1`) in the `apiVersion` field below — don't assume.
+
+### Step 35: Create the ClusterSecretStore
+
+```bash
+cat > secretstore.yaml << 'EOF'
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-manager
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: us-east-2
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets-sa
+            namespace: external-secrets
+EOF
+
+kubectl apply -f secretstore.yaml
+kubectl describe clustersecretstore aws-secrets-manager
+```
+
+Look for `Status: Valid` near the bottom of the `describe` output.
+
+### Step 36: Create the ExternalSecret and take over `gh-pat`
+
+```bash
+# Remove the manually-created secret from Step 7 so ESO can own it cleanly
+kubectl delete secret gh-pat -n arc-runners
+
+cat > gh-pat-external-secret.yaml << 'EOF'
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: gh-pat-external
+  namespace: arc-runners
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: gh-pat
+    creationPolicy: Owner
+  data:
+    - secretKey: github_token
+      remoteRef:
+        key: github-action-runners/gh-pat
+        property: github_token
+EOF
+
+kubectl apply -f gh-pat-external-secret.yaml
+```
+
+`target.name: gh-pat` recreates the exact same secret name that `githubConfigSecret: gh-pat` in `values-small.yaml` (Step 8 / Part 3) already points at — no change needed anywhere else.
+
+### Step 37: Verify
+
+```bash
+kubectl get clustersecretstore aws-secrets-manager
+kubectl get externalsecret gh-pat-external -n arc-runners
+kubectl get secret gh-pat -n arc-runners
+kubectl logs -n arc-systems <listener-pod-name> --tail=20
+```
+
+Expect: `ClusterSecretStore` status `Valid`, `ExternalSecret` status `SecretSynced`, `gh-pat` present with a recent age, and the listener still showing the healthy idle-polling pattern from Step 9 — confirming ARC didn't lose GitHub auth during the handoff from the manual secret to the Secrets-Manager-backed one.
+
+### Gotchas hit during this setup
+
+1. **`no matches for kind "SecretStore" in version "external-secrets.io/v1beta1", ensure CRDs are installed first`**: the YAML's `apiVersion` didn't match what the installed CRDs actually serve. Fixed by running Step 34's `jsonpath` check first and matching the real version rather than guessing.
+2. **Admission webhook denied: `invalid Auth.JWT.ServiceAccountRef: namespace should either be empty or match the namespace of the SecretStore for a namespaced SecretStore`**: a namespaced `SecretStore` (created in `arc-runners`) can't reference a ServiceAccount in a different namespace (`external-secrets-sa` in `external-secrets`) — cross-namespace references are only allowed for cluster-scoped stores. Fixed by using `kind: ClusterSecretStore` instead of `SecretStore`, and matching `secretStoreRef.kind: ClusterSecretStore` in the `ExternalSecret`.
+
 ## Pod capacity reference (3-node cluster)
 
 **maxPods = ENIs × (IPs per ENI − 1) + 2**
@@ -837,14 +950,17 @@ Fix is one of: scale back to 3 nodes (fastest), move to a bigger instance type w
 - **Node headroom**: with only 3 nodes, losing one to maintenance/an AZ issue removes roughly a third of capacity — consider `minSize: 3, maxSize: 5` for headroom during rollouts.
 - **ArgoCD UI exposure**: if using the LoadBalancer option from Step 18, restrict the security group to trusted IPs rather than leaving `argocd-server` open to the internet.
 - **ArgoCD admin password**: rotate it after first login (`argocd account update-password`) rather than leaving the initial auto-generated one in place long-term.
+- **PAT rotation**: rotating the GitHub PAT is now a one-step change in AWS Secrets Manager (update the secret value) — ESO's `refreshInterval: 1h` picks it up automatically, no `kubectl`/`helm` action needed.
+- **IRSA scope**: the `ExternalSecretsGhPatRead` policy is scoped to exactly one secret ARN — widen it deliberately if more secrets get moved into Secrets Manager later, rather than granting broad `secretsmanager:*` access.
 
 ## What's next (not yet built)
 
 - Resolve the node-count vs. pod-capacity tradeoff from Step 30 with a deliberate choice (stay at 3 `t3.small` nodes, move to a bigger instance type, or enable VPC CNI prefix delegation) rather than the default of scaling back up.
 - Wire the ARC workflow to commit an image-tag bump to the `manifests/` folder on a successful build, so CI (ARC) and CD (ArgoCD) are fully connected rather than ArgoCD watching a repo nothing pushes to yet.
 - Move to an App-of-Apps ArgoCD pattern once there's more than one app/environment to manage (deliberately skipped for now — `arc-runner-set` and `argocd-demo` were each applied as standalone Applications).
-- Replace the raw `kubectl create secret` for the GitHub PAT with External Secrets Operator pulling from AWS Secrets Manager.
 - Push the `terraform/` directory (`backend.tf`, `main.tf`) into the Git repo, matching the pattern already used for `manifests/` and `arc-runner-set/`.
+- Push the `external-secrets/` folder (`secretstore.yaml`, `gh-pat-external-secret.yaml`) into the Git repo and, optionally, bring it under ArgoCD management too, matching the GitOps pattern used everywhere else.
+- Move the ArgoCD admin password used by `.github/workflows/argocd-sync.yml` off a shared admin credential and onto a dedicated least-privilege ArgoCD account/token.
 
 ## Sources
 
@@ -857,3 +973,6 @@ Fix is one of: scale back to 3 nodes (fastest), move to a bigger instance type w
 - [Amazon EKS one-click cluster access through CloudShell](https://aws.amazon.com/about-aws/whats-new/2026/04/amazon-eks-one-click-cluster-access/)
 - [Install ArgoCD on Amazon EKS: Complete GitOps Guide](https://computingforgeeks.com/argocd-eks-gitops-complete-guide/)
 - [GitOps with ArgoCD on AWS EKS — Production Setup](https://itdefined.org/blogs/details/83/gitops-with-argocd-on-aws-eks:-the-production-grade-setup/)
+- [External Secrets Operator documentation](https://external-secrets.io/latest/)
+- [External Secrets Operator — AWS Secrets Manager provider](https://external-secrets.io/latest/provider/aws-secrets-manager/)
+- [IAM roles for service accounts (IRSA) — Amazon EKS User Guide](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)
