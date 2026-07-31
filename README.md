@@ -1,6 +1,14 @@
 # Building a GitOps CI/CD Pipeline on Amazon EKS: GitHub Actions Runners (ARC), ArgoCD, and Terraform
 
-Tested, working, end-to-end guide covering all five phases built on the `github-action-runners` cluster in `us-east-2`: **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI. **Part 2** — ArgoCD for GitOps-style continuous deployment. **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file. **Part 4** — importing the cluster and node group into Terraform, so infra changes go through version control too. **Part 5** — replacing the manually-created GitHub PAT secret with AWS Secrets Manager, synced into the cluster via External Secrets Operator (ESO). All four legs of the original plan (GitHub + ArgoCD + Terraform + EKS) are in place, plus this secrets-management hardening on top. Every gotcha hit along the way is included, not just the happy path.
+Tested, working, end-to-end guide covering all five phases built on the `github-action-runners` cluster in `us-east-2`:
+
+- **Part 1** — GitHub Actions self-hosted runners via the Actions Runner Controller (ARC), for CI.
+- **Part 2** — ArgoCD for GitOps-style continuous deployment.
+- **Part 3** — handing the ARC runner scale set itself over to GitOps, so `minRunners`/`maxRunners` are managed via a Git-tracked values file.
+- **Part 4** — importing the cluster and node group into Terraform, so infra changes go through version control too.
+- **Part 5** — replacing the manually-created GitHub PAT secret with AWS Secrets Manager, synced into the cluster via External Secrets Operator (ESO).
+
+All four legs of the original plan (GitHub + ArgoCD + Terraform + EKS) are in place, plus this secrets-management hardening on top. Every gotcha hit along the way is included, not just the happy path.
 
 ## Architecture recap
 
