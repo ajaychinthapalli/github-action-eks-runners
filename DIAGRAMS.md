@@ -19,7 +19,7 @@ graph TB
             EKS["EKS Control Plane<br/>(Managed by AWS)"]
             SG["Security Group"]
             
-            subgraph "Worker Nodes<br/>(t3.small)"
+            subgraph "Worker Nodes (t3.small)"
                 Node1["Node 1<br/>2vCPU, 2GB RAM"]
                 Node2["Node 2<br/>2vCPU, 2GB RAM"]
                 Node3["Node 3<br/>2vCPU, 2GB RAM"]
@@ -53,12 +53,12 @@ graph TB
         Docker["Docker Registry"]
     end
     
-    GH -->|Webhook Event<br/>(PAT Auth)| Listener
-    GH -->|Job Status Updates<br/>(PAT Auth)| ARC
+    GH -->|Webhook Event (PAT Auth)| Listener
+    GH -->|Job Status Updates (PAT Auth)| ARC
     ARC -->|Create/Manage| Runner1
     ARC -->|Create/Manage| Runner2
     ARC -->|Create/Manage| RunnerN
-    Runner1 -->|Report Status<br/>(PAT Auth)| GH
+    Runner1 -->|Report Status (PAT Auth)| GH
     EKS -->|Manages| Node1
     EKS -->|Manages| Node2
     EKS -->|Manages| Node3
